@@ -147,9 +147,10 @@ func handleSchemaEvent(sqsClient *sqs.Client, queueURL string, schema string, ti
 
     // Send message to SQS
     _, err = sqsClient.SendMessage(context.Background(), &sqs.SendMessageInput{
-        QueueUrl:       &queueURL,
-        MessageBody:    &messageBodyStr,
-        MessageGroupId: &schema,
+        QueueUrl:               &queueURL,
+        MessageBody:            &messageBodyStr,
+        MessageGroupId:         &schema,
+        MessageDeduplicationId: &schema,
     })
     if err != nil {
         log.Errorf("failed to send message to SQS for schema %s: %v", schema, err)

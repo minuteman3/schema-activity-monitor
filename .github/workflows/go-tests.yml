@@ -35,16 +35,21 @@ jobs:
       - name: Check out code
         uses: actions/checkout@v4
 
+      - name: Configure MySQL
+        run: |
+          mysql -h 127.0.0.1 -u root -ppassword -e "
+            SET GLOBAL binlog_format = 'ROW';
+            SET GLOBAL binlog_row_image = 'FULL';
+            SET GLOBAL enforce_gtid_consistency = 'ON';
+            SET GLOBAL gtid_mode = 'OFF_PERMISSIVE';
+            SET GLOBAL gtid_mode = 'ON_PERMISSIVE';
+            SET GLOBAL gtid_mode = 'ON';
+          "
+
       - name: Get dependencies
         run: |
           go mod tidy
           go get -v -t -d ./...
-
-      - name: Configure MySQL for binlog
-        run: |
-          # Connect to MySQL and enable binlog if needed
-          mysql -h 127.0.0.1 -P 3306 -u root -ppassword -e "SET GLOBAL binlog_format = 'ROW';"
-          mysql -h 127.0.0.1 -P 3306 -u root -ppassword -e "SET GLOBAL binlog_row_image = 'FULL';"
 
       - name: Run unit tests
         run: go test -v -race ./... -run "^Test[^Integration]"

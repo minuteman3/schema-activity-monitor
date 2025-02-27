@@ -1,0 +1,58 @@
+name: Go Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+
+    services:
+      # Setup MySQL service container
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: password
+          MYSQL_DATABASE: test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h localhost -u root -ppassword"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    steps:
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: "1.22.x"
+
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Get dependencies
+        run: |
+          go mod tidy
+          go get -v -t -d ./...
+
+      - name: Configure MySQL for binlog
+        run: |
+          # Connect to MySQL and enable binlog if needed
+          mysql -h 127.0.0.1 -P 3306 -u root -ppassword -e "SET GLOBAL binlog_format = 'ROW';"
+          mysql -h 127.0.0.1 -P 3306 -u root -ppassword -e "SET GLOBAL binlog_row_image = 'FULL';"
+
+      - name: Run unit tests
+        run: go test -v -race ./... -run "^Test[^Integration]"
+
+      - name: Run integration tests
+        env:
+          RUN_INTEGRATION_TESTS: "true"
+          TEST_MYSQL_HOST: "127.0.0.1"
+          TEST_MYSQL_USER: "root"
+          TEST_MYSQL_PASSWORD: "password"
+        run: go test -v -race ./... -run "^TestIntegration"

@@ -21,6 +21,10 @@ type SchemaEvent struct {
     Timestamp time.Time `json:"timestamp"`
 }
 
+type SQSClientInterface interface {
+    SendMessage(ctx context.Context, params *sqs.SendMessageInput, optFns ...func(*sqs.Options)) (*sqs.SendMessageOutput, error)
+}
+
 func main() {
     // Define command line flags
     username := flag.String("user", "root", "MySQL username")
@@ -124,7 +128,7 @@ func main() {
     }
 }
 
-func handleSchemaEvent(sqsClient *sqs.Client, queueURL string, schema string, timestamp uint32) {
+func handleSchemaEvent(sqsClient SQSClientInterface, queueURL string, schema string, timestamp uint32) {
     eventTime := time.Unix(int64(timestamp), 0)
     event := SchemaEvent{
         Schema:    schema,

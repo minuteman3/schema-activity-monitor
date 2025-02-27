@@ -71,13 +71,23 @@ func TestIntegrationBinlogSync(t *testing.T) {
 
 	// Create a channel to signal that streamer is ready
 	streamerReady := make(chan struct{})
+	// Create a channel to signal that data insertion is complete
+	insertDone := make(chan struct{})
+
+	// Create a separate connection for the data insertion goroutine
+	insertConn, err := client.Connect(fmt.Sprintf("%s:%d", host, port), username, password, "")
+	if err != nil {
+		t.Fatalf("Failed to create second MySQL connection: %v", err)
+	}
+	defer insertConn.Close()
 
 	// Make a data change in another goroutine
 	go func() {
+		defer close(insertDone)
 		// Wait for signal that streamer is ready
 		<-streamerReady
 
-		_, err := conn.Execute(fmt.Sprintf("INSERT INTO %s.test_table (name) VALUES ('test1')", testDB))
+		_, err := insertConn.Execute(fmt.Sprintf("INSERT INTO %s.test_table (name) VALUES ('test1')", testDB))
 		if err != nil {
 			t.Errorf("Failed to insert test data: %v", err)
 		}
@@ -94,11 +104,13 @@ func TestIntegrationBinlogSync(t *testing.T) {
 	for {
 		ev, err := streamer.GetEvent(ctx)
 		if err != nil {
+			t.Logf("Stopping event processing: %v", err)
 			break // Timeout or error
 		}
 
 		// Look for our RowsEvent
 		if rowsEvent, ok := ev.Event.(*replication.RowsEvent); ok {
+			t.Logf("Found rows event for schema: %s, table: %s", string(rowsEvent.Table.Schema), string(rowsEvent.Table.Table))
 			if string(rowsEvent.Table.Schema) == testDB {
 				foundRowsEvent = true
 				assert.Equal(t, "test_table", string(rowsEvent.Table.Table))
@@ -106,6 +118,9 @@ func TestIntegrationBinlogSync(t *testing.T) {
 			}
 		}
 	}
+
+	// Wait for the insert operation to complete before cleaning up
+	<-insertDone
 
 	assert.True(t, foundRowsEvent, "Should have captured a rows event for our test database")
 }

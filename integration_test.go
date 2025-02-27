@@ -69,14 +69,22 @@ func TestIntegrationBinlogSync(t *testing.T) {
 		t.Fatalf("Error starting sync: %v", err)
 	}
 
+	// Create a channel to signal that streamer is ready
+	streamerReady := make(chan struct{})
+
 	// Make a data change in another goroutine
 	go func() {
-		time.Sleep(1 * time.Second) // Wait a bit for streamer to start
+		// Wait for signal that streamer is ready
+		<-streamerReady
+
 		_, err := conn.Execute(fmt.Sprintf("INSERT INTO %s.test_table (name) VALUES ('test1')", testDB))
 		if err != nil {
 			t.Errorf("Failed to insert test data: %v", err)
 		}
 	}()
+
+	// Signal that streamer is ready to receive events
+	close(streamerReady)
 
 	// Read events with a timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

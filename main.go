@@ -35,6 +35,8 @@ type SQSWorker struct {
 	wg          sync.WaitGroup
 	ctx         context.Context
 	cancel      context.CancelFunc
+	mu          sync.RWMutex // Protects the stopped flag
+	stopped     bool         // Indicates if the worker is stopping/stopped
 }
 
 // NewSQSWorker creates a new SQS worker pool
@@ -63,12 +65,19 @@ func (w *SQSWorker) Start() {
 func (w *SQSWorker) Stop() {
 	log.Info("Stopping SQS workers, waiting for queued messages to be processed...")
 
-	// First cancel the context to signal workers to stop accepting new work
+	// Mark as stopping to prevent new events from being enqueued
+	w.mu.Lock()
+	if w.stopped {
+		w.mu.Unlock()
+		return // Already stopped
+	}
+	w.stopped = true
+	w.mu.Unlock()
+
+	// Signal workers to stop accepting new work
 	w.cancel()
 
-	// Wait for all events in the queue to be processed
-	// Note: we must close the channel after canceling context
-	// so workers can drain the remaining events
+	// Close the channel to signal workers to exit after processing remaining events
 	close(w.eventQueue)
 
 	// Wait for all workers to finish
@@ -78,6 +87,15 @@ func (w *SQSWorker) Stop() {
 
 // EnqueueEvent adds a schema event to the processing queue
 func (w *SQSWorker) EnqueueEvent(schema string, timestamp uint32) bool {
+	// Check if worker is stopping/stopped before attempting to enqueue
+	w.mu.RLock()
+	if w.stopped {
+		w.mu.RUnlock()
+		log.Warnf("SQS worker is stopped, dropping event for schema %s", schema)
+		return true
+	}
+	w.mu.RUnlock()
+
 	eventTime := time.Unix(int64(timestamp), 0)
 	event := SchemaEvent{
 		Schema:    schema,

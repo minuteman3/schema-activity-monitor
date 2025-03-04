@@ -20,6 +20,7 @@ import (
 type SchemaEvent struct {
 	Schema    string    `json:"schema"`
 	Timestamp time.Time `json:"timestamp"`
+	GTID      string    `json:"gtid,omitempty"` // Add GTID field to track position
 }
 
 type SQSClientInterface interface {
@@ -37,10 +38,11 @@ type SQSWorker struct {
 	cancel      context.CancelFunc
 	mu          sync.RWMutex // Protects the stopped flag
 	stopped     bool         // Indicates if the worker is stopping/stopped
+	resumeFile  string       // Path to file for storing the last processed GTID
 }
 
 // NewSQSWorker creates a new SQS worker pool
-func NewSQSWorker(client SQSClientInterface, queueURL string, bufferSize int, workerCount int) *SQSWorker {
+func NewSQSWorker(client SQSClientInterface, queueURL string, bufferSize int, workerCount int, resumeFile string) *SQSWorker {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &SQSWorker{
 		client:      client,
@@ -49,6 +51,7 @@ func NewSQSWorker(client SQSClientInterface, queueURL string, bufferSize int, wo
 		workerCount: workerCount,
 		ctx:         ctx,
 		cancel:      cancel,
+		resumeFile:  resumeFile,
 	}
 }
 
@@ -86,7 +89,7 @@ func (w *SQSWorker) Stop() {
 }
 
 // EnqueueEvent adds a schema event to the processing queue
-func (w *SQSWorker) EnqueueEvent(schema string, timestamp uint32) bool {
+func (w *SQSWorker) EnqueueEvent(schema string, timestamp uint32, gtid string) bool {
 	// Check if worker is stopping/stopped before attempting to enqueue
 	w.mu.RLock()
 	if w.stopped {
@@ -100,6 +103,7 @@ func (w *SQSWorker) EnqueueEvent(schema string, timestamp uint32) bool {
 	event := SchemaEvent{
 		Schema:    schema,
 		Timestamp: eventTime,
+		GTID:      gtid,
 	}
 
 	// Try to enqueue the event, drop it if queue is full
@@ -149,12 +153,40 @@ func (w *SQSWorker) worker(id int) {
 	log.Debugf("SQS worker %d stopped", id)
 }
 
+// saveGTID writes the most recent GTID to the resume file
+func (w *SQSWorker) saveGTID(gtid string) {
+	if w.resumeFile == "" || gtid == "" {
+		return
+	}
+
+	// Write GTID to file atomically by writing to a temp file first and then renaming
+	tempFile := w.resumeFile + ".tmp"
+	err := os.WriteFile(tempFile, []byte(gtid), 0644)
+	if err != nil {
+		log.Errorf("failed to write GTID to temp file: %v", err)
+		return
+	}
+
+	err = os.Rename(tempFile, w.resumeFile)
+	if err != nil {
+		log.Errorf("failed to rename temp file to resume file: %v", err)
+		return
+	}
+
+	log.Debugf("saved GTID to resume file: %s", gtid)
+}
+
 // sendEventToSQS sends a single event to SQS with retries
 func (w *SQSWorker) sendEventToSQS(event SchemaEvent) {
 	if w.client == nil || w.queueURL == "" {
 		// Just log the event if no SQS is configured
 		messageBody, _ := json.Marshal(event)
 		log.Infof("would have sent to SQS: %s", string(messageBody))
+		
+		// Save GTID even if we're not sending to SQS
+		if event.GTID != "" {
+			w.saveGTID(event.GTID)
+		}
 		return
 	}
 
@@ -191,6 +223,11 @@ func (w *SQSWorker) sendEventToSQS(event SchemaEvent) {
 		if err == nil {
 			// Success
 			log.Debugf("sent schema event to SQS: %s at %s", event.Schema, event.Timestamp.Format(time.RFC3339))
+			
+			// Save the GTID after successful send
+			if event.GTID != "" {
+				w.saveGTID(event.GTID)
+			}
 			return
 		}
 
@@ -202,6 +239,31 @@ func (w *SQSWorker) sendEventToSQS(event SchemaEvent) {
 		event.Schema, maxRetries)
 }
 
+// loadGTIDFromFile attempts to load a GTID from the specified file
+func loadGTIDFromFile(path string) (string, error) {
+	if path == "" {
+		return "", fmt.Errorf("no resume file path provided")
+	}
+
+	// Check if file exists
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return "", fmt.Errorf("resume file does not exist: %s", path)
+	}
+
+	// Read GTID from file
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("failed to read resume file: %v", err)
+	}
+
+	gtid := string(content)
+	if gtid == "" {
+		return "", fmt.Errorf("resume file is empty")
+	}
+
+	return gtid, nil
+}
+
 func main() {
 	// Define command line flags
 	username := flag.String("user", "root", "MySQL username")
@@ -210,6 +272,7 @@ func main() {
 	port := flag.Int("port", 3306, "MySQL port")
 	serverID := flag.Uint("server-id", 42897, "Unique server ID for binlog sync")
 	gtidSet := flag.String("gtid-set", "", "GTID set to start syncing from")
+	resumeFile := flag.String("resume-file", "", "Path to file for storing/resuming the last processed GTID")
 	queueURL := flag.String("queue-url", "", "SQS FIFO queue URL (optional)")
 	workerCount := flag.Int("workers", 5, "Number of SQS worker goroutines")
 	queueSize := flag.Int("queue-size", 10000, "Size of the internal event queue")
@@ -235,7 +298,7 @@ func main() {
 	}
 
 	// Create and start the SQS worker pool
-	sqsWorker := NewSQSWorker(sqsClient, *queueURL, *queueSize, *workerCount)
+	sqsWorker := NewSQSWorker(sqsClient, *queueURL, *queueSize, *workerCount, *resumeFile)
 	sqsWorker.Start()
 	defer sqsWorker.Stop()
 
@@ -253,8 +316,27 @@ func main() {
 	// Start syncing from the specified position
 	var streamer *replication.BinlogStreamer
 	var err error
-	if *gtidSet == "" {
-		// Connect to MySQL to get current position
+	var startingGTIDStr string
+
+	// First check for resume file
+	if *resumeFile != "" {
+		// Try to load GTID from resume file
+		resumedGTID, err := loadGTIDFromFile(*resumeFile)
+		if err == nil {
+			log.Infof("Resuming from GTID in resume file: %s", resumedGTID)
+			startingGTIDStr = resumedGTID
+		} else {
+			log.Infof("Could not load GTID from resume file: %v", err)
+			// Fall back to gtid-set flag or current position
+			startingGTIDStr = *gtidSet
+		}
+	} else {
+		// No resume file, use gtid-set flag
+		startingGTIDStr = *gtidSet
+	}
+
+	if startingGTIDStr == "" {
+		// No GTID specified by any method, get current position
 		conn, err := client.Connect(fmt.Sprintf("%s:%d", *host, *port), *username, *password, "")
 		if err != nil {
 			log.Errorf("Error connecting to MySQL: %v", err)
@@ -263,29 +345,22 @@ func main() {
 		defer conn.Close()
 
 		// Get current GTID set
-		var gtidStr string
 		result, err := conn.Execute("SELECT @@GLOBAL.GTID_EXECUTED")
 		if err != nil {
 			log.Errorf("Error getting current GTID position: %v", err)
 			os.Exit(1)
 		}
-		gtidStr = string(result.Values[0][0].AsString())
-
-		currentGTIDSet, err := mysql.ParseGTIDSet(mysql.MySQLFlavor, gtidStr)
-		if err != nil {
-			log.Errorf("Error parsing GTID set: %v", err)
-			os.Exit(1)
-		}
-		streamer, err = syncer.StartSyncGTID(currentGTIDSet)
-	} else {
-		// Parse provided GTID set and start from there
-		mysqlGTIDSet, err := mysql.ParseGTIDSet(mysql.MySQLFlavor, *gtidSet)
-		if err != nil {
-			log.Errorf("Error parsing GTID set: %v", err)
-			os.Exit(1)
-		}
-		streamer, err = syncer.StartSyncGTID(mysqlGTIDSet)
+		startingGTIDStr = string(result.Values[0][0].AsString())
+		log.Infof("Starting from current GTID position: %s", startingGTIDStr)
 	}
+
+	// Parse the GTID set and start streaming
+	mysqlGTIDSet, err := mysql.ParseGTIDSet(mysql.MySQLFlavor, startingGTIDStr)
+	if err != nil {
+		log.Errorf("Error parsing GTID set: %v", err)
+		os.Exit(1)
+	}
+	streamer, err = syncer.StartSyncGTID(mysqlGTIDSet)
 
 	if err != nil {
 		log.Errorf("Error starting sync: %v", err)
@@ -298,8 +373,45 @@ func main() {
 	eventCount := 0
 	lastEventCount := 0
 
+	// Track the current GTID position
+	var currentGTID string = startingGTIDStr
+
+	// Start a goroutine to periodically fetch the current GTID
+	gtidUpdateTicker := time.NewTicker(5 * time.Second)
+	defer gtidUpdateTicker.Stop()
+
+	gtidUpdateChan := make(chan string)
+	go func() {
+		for range gtidUpdateTicker.C {
+			conn, err := client.Connect(fmt.Sprintf("%s:%d", *host, *port), *username, *password, "")
+			if err != nil {
+				log.Errorf("Error connecting to MySQL for GTID update: %v", err)
+				continue
+			}
+
+			result, err := conn.Execute("SELECT @@GLOBAL.GTID_EXECUTED")
+			conn.Close()
+			if err != nil {
+				log.Errorf("Error getting current GTID: %v", err)
+				continue
+			}
+
+			gtid := string(result.Values[0][0].AsString())
+			gtidUpdateChan <- gtid
+		}
+	}()
+
 	// Read events from the binlog
 	for {
+		// Check for GTID updates (non-blocking)
+		select {
+		case newGTID := <-gtidUpdateChan:
+			currentGTID = newGTID
+			log.Debugf("Updated current GTID to: %s", currentGTID)
+		default:
+			// Continue without blocking
+		}
+
 		ev, err := streamer.GetEvent(context.Background())
 		if err != nil {
 			log.Errorf("failed to get event: %v", err)
@@ -313,7 +425,8 @@ func main() {
 
 			// Instead of blocking on SQS, simply enqueue the event for async processing
 			schema := string(e.Table.Schema)
-			if !sqsWorker.EnqueueEvent(schema, ev.Header.Timestamp) {
+			
+			if !sqsWorker.EnqueueEvent(schema, ev.Header.Timestamp, currentGTID) {
 				// Log processing rate periodically
 				now := time.Now()
 				if now.Sub(lastStatTime) >= statsInterval {

@@ -174,7 +174,7 @@ func TestIntegrationAsyncSQSWorker(t *testing.T) {
 	defer cleanupTestDatabase(t, conn, testDB)
 
 	// Create and start the SQS worker with a small queue
-	worker := NewSQSWorker(mockClient, queueURL, 5, 2)
+	worker := NewSQSWorker(mockClient, queueURL, 5, 2, "")
 	worker.Start()
 	defer worker.Stop()
 
@@ -225,7 +225,9 @@ func TestIntegrationAsyncSQSWorker(t *testing.T) {
 			// Process row events
 			if rowsEvent, ok := ev.Event.(*replication.RowsEvent); ok {
 				schema := string(rowsEvent.Table.Schema)
-				worker.EnqueueEvent(schema, ev.Header.Timestamp)
+				// Get the current GTID position if available
+				gtidStr := "test-gtid-position" // Use a static position for testing
+				worker.EnqueueEvent(schema, ev.Header.Timestamp, gtidStr)
 			}
 		}
 	}()

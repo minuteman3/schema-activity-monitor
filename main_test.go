@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -87,12 +88,12 @@ func TestSQSWorkerEnqueue(t *testing.T) {
 	// Create a worker with a small buffer to test enqueue behavior
 	mockClient := new(MockSQSClient)
 	queueURL := "https://sqs.region.amazonaws.com/123456789012/test-queue.fifo"
-	worker := NewSQSWorker(mockClient, queueURL, 2, 1)
+	worker := NewSQSWorker(mockClient, queueURL, 2, 1, "")
 
 	// Test successful enqueue (no backpressure)
 	schema := "test_schema"
 	timestamp := uint32(time.Now().Unix())
-	backpressure := worker.EnqueueEvent(schema, timestamp)
+	backpressure := worker.EnqueueEvent(schema, timestamp, "")
 	assert.False(t, backpressure, "Should not apply backpressure on first enqueue")
 
 	// The event should be in the queue now, worker not started so we can check directly
@@ -103,10 +104,10 @@ func TestSQSWorkerBackpressure(t *testing.T) {
 	// Create a worker with a very small buffer to test backpressure
 	mockClient := new(MockSQSClient)
 	queueURL := "https://sqs.region.amazonaws.com/123456789012/test-queue.fifo"
-	worker := NewSQSWorker(mockClient, queueURL, 1, 1)
+	worker := NewSQSWorker(mockClient, queueURL, 1, 1, "")
 
 	// Fill the queue
-	worker.EnqueueEvent("schema1", uint32(time.Now().Unix()))
+	worker.EnqueueEvent("schema1", uint32(time.Now().Unix()), "")
 
 	// This will trigger our backpressure logic
 	// Use a goroutine with timeout because it might block
@@ -116,7 +117,7 @@ func TestSQSWorkerBackpressure(t *testing.T) {
 
 	go func() {
 		defer wg.Done()
-		backpressure = worker.EnqueueEvent("schema2", uint32(time.Now().Unix()))
+		backpressure = worker.EnqueueEvent("schema2", uint32(time.Now().Unix()), "")
 	}()
 
 	// Wait for the enqueue operation to complete or timeout
@@ -143,7 +144,7 @@ func TestSQSWorkerProcessing(t *testing.T) {
 	queueURL := "https://sqs.region.amazonaws.com/123456789012/test-queue.fifo"
 
 	// Create a worker and start it
-	worker := NewSQSWorker(mockClient, queueURL, 5, 1)
+	worker := NewSQSWorker(mockClient, queueURL, 5, 1, "")
 	worker.Start()
 	defer worker.Stop()
 
@@ -158,7 +159,7 @@ func TestSQSWorkerProcessing(t *testing.T) {
 	// Enqueue an event
 	schema := "test_schema"
 	timestamp := uint32(time.Now().Unix())
-	worker.EnqueueEvent(schema, timestamp)
+	worker.EnqueueEvent(schema, timestamp, "test-gtid-1")
 
 	// Give some time for the worker to process
 	time.Sleep(100 * time.Millisecond)
@@ -182,12 +183,12 @@ func TestSQSWorkerGracefulShutdown(t *testing.T) {
 		Return(&sqs.SendMessageOutput{MessageId: new(string)}, nil)
 
 	// Create a worker and start it
-	worker := NewSQSWorker(mockClient, queueURL, 10, 2)
+	worker := NewSQSWorker(mockClient, queueURL, 10, 2, "")
 	worker.Start()
 
 	// Enqueue multiple events
 	for i := 0; i < 5; i++ {
-		worker.EnqueueEvent(fmt.Sprintf("schema%d", i), uint32(time.Now().Unix()))
+		worker.EnqueueEvent(fmt.Sprintf("schema%d", i), uint32(time.Now().Unix()), fmt.Sprintf("test-gtid-%d", i))
 	}
 
 	// Start shutdown - this should wait for queued messages to process
@@ -201,4 +202,67 @@ func TestSQSWorkerGracefulShutdown(t *testing.T) {
 
 	// Verify all messages were processed
 	mockClient.AssertNumberOfCalls(t, "SendMessage", 5)
+}
+
+func TestResumeFile(t *testing.T) {
+	// Create a temporary file for testing
+	tempDir := t.TempDir()
+	resumeFilePath := tempDir + "/resume.gtid"
+
+	// Create mock client
+	mockClient := new(MockSQSClient)
+	queueURL := "https://sqs.region.amazonaws.com/123456789012/test-queue.fifo"
+
+	// Expect messages to be sent
+	mockClient.On("SendMessage", mock.Anything, mock.MatchedBy(func(input *sqs.SendMessageInput) bool {
+		return input.QueueUrl != nil && *input.QueueUrl == queueURL
+	})).Return(&sqs.SendMessageOutput{MessageId: new(string)}, nil)
+
+	// Create a worker with resume file
+	worker := NewSQSWorker(mockClient, queueURL, 5, 1, resumeFilePath)
+	worker.Start()
+	defer worker.Stop()
+
+	// Enqueue events with GTID
+	testGTID := "d4c59d03-c9bb-11ec-9d64-0242ac110002:1-200"
+	worker.EnqueueEvent("test_schema", uint32(time.Now().Unix()), testGTID)
+
+	// Wait for processing
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify message was sent
+	mockClient.AssertNumberOfCalls(t, "SendMessage", 1)
+
+	// Read resume file and verify GTID was saved
+	content, err := os.ReadFile(resumeFilePath)
+	assert.NoError(t, err, "Should be able to read resume file")
+	assert.Equal(t, testGTID, string(content), "Resume file should contain the GTID")
+}
+
+func TestLoadGTIDFromFile(t *testing.T) {
+	// Test with a file that doesn't exist
+	gtid, err := loadGTIDFromFile("/nonexistent/path.gtid")
+	assert.Error(t, err)
+	assert.Empty(t, gtid)
+	
+	// Test with a valid file
+	tempDir := t.TempDir()
+	resumeFilePath := tempDir + "/resume.gtid"
+	
+	testGTID := "server-uuid:1-200"
+	err = os.WriteFile(resumeFilePath, []byte(testGTID), 0644)
+	assert.NoError(t, err)
+	
+	gtid, err = loadGTIDFromFile(resumeFilePath)
+	assert.NoError(t, err)
+	assert.Equal(t, testGTID, gtid)
+	
+	// Test with an empty file
+	emptyFilePath := tempDir + "/empty.gtid"
+	err = os.WriteFile(emptyFilePath, []byte(""), 0644)
+	assert.NoError(t, err)
+	
+	gtid, err = loadGTIDFromFile(emptyFilePath)
+	assert.Error(t, err)
+	assert.Empty(t, gtid)
 }

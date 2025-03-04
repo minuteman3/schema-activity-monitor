@@ -11,6 +11,7 @@ Schema Activity Monitor watches MySQL binary logs for data modification events a
 - Monitors MySQL binlog events in real-time
 - Tracks schema-level activity
 - Supports GTID-based replication positioning
+- Automatic position tracking with resume file for restart recovery
 - Asynchronous event processing with configurable worker pool
 - Backpressure handling for high event volumes
 - Optional integration with Amazon SQS FIFO queues
@@ -36,6 +37,12 @@ Start from specific GTID position:
 ./schema-activity-monitor -gtid-set "f56c3314-1d5e-11ee-9277-0242ac110002:1-200"
 ```
 
+Using resume file for automatic position tracking:
+
+```bash
+./schema-activity-monitor -resume-file /path/to/position.gtid
+```
+
 With custom worker configuration:
 
 ```bash
@@ -44,18 +51,19 @@ With custom worker configuration:
 
 ## Command Line Options
 
-| Option      | Description                      | Default   |
-| ----------- | -------------------------------- | --------- |
-| -user       | MySQL username                   | root      |
-| -password   | MySQL password                   | -         |
-| -host       | MySQL host                       | localhost |
-| -port       | MySQL port                       | 3306      |
-| -server-id  | Unique server ID for binlog sync | 42897     |
-| -gtid-set   | GTID set to start syncing from   | -         |
-| -queue-url  | SQS FIFO queue URL               | -         |
-| -workers    | Number of SQS worker goroutines  | 5         |
-| -queue-size | Size of the internal event queue | 10000     |
-| -verbose    | Enable debug logging             | false     |
+| Option        | Description                                  | Default   |
+| ------------- | -------------------------------------------- | --------- |
+| -user         | MySQL username                               | root      |
+| -password     | MySQL password                               | -         |
+| -host         | MySQL host                                   | localhost |
+| -port         | MySQL port                                   | 3306      |
+| -server-id    | Unique server ID for binlog sync             | 42897     |
+| -gtid-set     | GTID set to start syncing from               | -         |
+| -resume-file  | Path to file for storing/resuming GTID state | -         |
+| -queue-url    | SQS FIFO queue URL                           | -         |
+| -workers      | Number of SQS worker goroutines              | 5         |
+| -queue-size   | Size of the internal event queue             | 10000     |
+| -verbose      | Enable debug logging                         | false     |
 
 ## Performance Tuning
 
@@ -73,7 +81,8 @@ When using SQS, events are sent as JSON messages:
 ```json
 {
   "schema": "database_name",
-  "timestamp": "2023-07-10T15:04:05Z"
+  "timestamp": "2023-07-10T15:04:05Z",
+  "gtid": "f56c3314-1d5e-11ee-9277-0242ac110002:1-200"
 }
 ```
 
@@ -89,3 +98,14 @@ When using the SQS integration, ensure:
 ## Monitoring
 
 The application logs processing rates periodically, reporting the number of events processed per second. Use this information to tune the worker and queue settings for your specific workload.
+
+## Automatic Resume
+
+When you specify a resume file using the `-resume-file` option:
+
+1. At startup, the tool checks if the file exists and contains a valid GTID
+2. If found, it resumes from that position, ignoring the `-gtid-set` option
+3. During operation, the current GTID position is periodically saved to the file
+4. If the tool is stopped and restarted, it will automatically continue from where it left off
+
+This ensures no events are lost between restarts and provides a safe way to upgrade or reconfigure the tool without losing track of processed events.

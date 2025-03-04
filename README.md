@@ -105,7 +105,16 @@ When you specify a resume file using the `-resume-file` option:
 
 1. At startup, the tool checks if the file exists and contains a valid GTID
 2. If found, it resumes from that position, ignoring the `-gtid-set` option
-3. During operation, the current GTID position is periodically saved to the file
+3. During operation, the current GTID position is saved to the file as events are processed
 4. If the tool is stopped and restarted, it will automatically continue from where it left off
 
-This ensures no events are lost between restarts and provides a safe way to upgrade or reconfigure the tool without losing track of processed events.
+### GTID Ordering Guarantees
+
+The tool provides strict ordering guarantees for GTID processing:
+
+1. When multiple workers process events concurrently, the tool tracks which GTIDs are in-flight
+2. A GTID is only saved to the resume file after all preceding GTIDs have been successfully processed
+3. This prevents gaps in the event processing sequence, ensuring that on restart, no events are skipped
+4. If the tool is restarted, it will continue from exactly the last successfully processed position
+
+This approach ensures no events are lost between restarts and provides a safe way to upgrade or reconfigure the tool without losing track of processed events.

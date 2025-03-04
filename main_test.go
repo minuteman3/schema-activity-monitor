@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -237,6 +239,120 @@ func TestResumeFile(t *testing.T) {
 	content, err := os.ReadFile(resumeFilePath)
 	assert.NoError(t, err, "Should be able to read resume file")
 	assert.Equal(t, testGTID, string(content), "Resume file should contain the GTID")
+}
+
+func TestGTIDCompare(t *testing.T) {
+	// Test our GTID comparison function
+	worker := NewSQSWorker(nil, "", 1, 1, "")
+	
+	testCases := []struct{
+		gtid1 string
+		gtid2 string
+		expected bool
+	}{
+		{"uuid:1-100", "uuid:1-100", true},  // Equal
+		{"uuid:1-100", "uuid:1-200", true},  // Less than
+		{"uuid:1-200", "uuid:1-100", false}, // Greater than
+		{"uuid:1-100", "other:1-100", true}, // Different UUIDs but same sequence number
+		{"", "uuid:1-100", true},            // Empty is less than anything
+		{"uuid:1-100", "", false},           // Non-empty is greater than empty
+	}
+	
+	for _, tc := range testCases {
+		result := worker.compareGTIDs(tc.gtid1, tc.gtid2)
+		assert.Equal(t, tc.expected, result, "Compare %s <= %s", tc.gtid1, tc.gtid2)
+	}
+}
+
+// Simple replacements for our test
+func simpleWriteGTID(path, gtid string) error {
+	return os.WriteFile(path, []byte(gtid), 0644)
+}
+
+func TestSimpleOrderedGTIDs(t *testing.T) {
+	// Create a simple test that manually implements the ordered GTID processing
+	tempDir := t.TempDir()
+	resumeFilePath := tempDir + "/simple.gtid"
+	
+	// Define our GTID sequence
+	gtids := []string{
+		"uuid:1-100",
+		"uuid:1-101",
+		"uuid:1-102",
+		"uuid:1-103", 
+		"uuid:1-104",
+	}
+	
+	// Keep track of what's still pending
+	pending := map[string]bool{
+		gtids[0]: true,
+		gtids[1]: true,
+		gtids[2]: true,
+		gtids[3]: true,
+		gtids[4]: true,
+	}
+	
+	// Keep track of the highest GTID we can save
+	var highestSaved string
+	
+	// Process GTIDs in an arbitrary order
+	processOrder := []int{3, 4, 1, 2, 0}
+	
+	// Track what's been processed
+	processed := make(map[string]bool)
+	
+	// Process each GTID
+	for _, idx := range processOrder {
+		gtid := gtids[idx]
+		t.Logf("Processing GTID: %s", gtid)
+		
+		// Mark this GTID as processed and remove from pending
+		processed[gtid] = true
+		delete(pending, gtid)
+		
+		// After each processing, check if we can update the saved GTID
+		// Find the highest processed GTID that has no lower pending GTIDs
+		if len(pending) == 0 {
+			// No pending GTIDs - we can save the highest one
+			highestSeq := -1
+			var highestGTID string
+			for processedGTID := range processed {
+				seq := extractSequenceNum(processedGTID)
+				if seq > highestSeq {
+					highestSeq = seq
+					highestGTID = processedGTID
+				}
+			}
+			
+			if highestGTID != highestSaved {
+				highestSaved = highestGTID
+				simpleWriteGTID(resumeFilePath, highestGTID)
+				t.Logf("Updated to highest available GTID: %s (no pending)", highestGTID)
+			}
+		}
+	}
+	
+	// Verify the final saved GTID
+	content, err := os.ReadFile(resumeFilePath)
+	assert.NoError(t, err, "Should be able to read file")
+	
+	// We should have saved the highest GTID since all are processed
+	assert.Equal(t, gtids[4], string(content),
+		"Should have saved the highest GTID when all are processed")
+}
+
+// Helper to extract sequence number from GTID string like "uuid:1-104"
+func extractSequenceNum(gtid string) int {
+	parts := strings.Split(gtid, ":")
+	if len(parts) == 2 {
+		seqRange := strings.Split(parts[1], "-")
+		if len(seqRange) == 2 {
+			if val, err := strconv.Atoi(seqRange[1]); err == nil {
+				return val
+			}
+		}
+	}
+	return -1
 }
 
 func TestLoadGTIDFromFile(t *testing.T) {

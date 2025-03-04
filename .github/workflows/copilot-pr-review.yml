@@ -1,0 +1,20 @@
+name: Request Copilot PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    branches: [main]
+
+jobs:
+  request-copilot-review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Request Copilot PR Review
+        uses: github/copilot-ghas-subscriber-action@v1
+        with:
+          pr_review: true
+          pr_review_summary: true
+          pr_analysis: true

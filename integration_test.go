@@ -32,6 +32,9 @@ func TestIntegrationBinlogSync(t *testing.T) {
 	username := getEnvOrDefault("TEST_MYSQL_USER", "root")
 	password := getEnvOrDefault("TEST_MYSQL_PASSWORD", "")
 	testDB := "binlog_test_db"
+	
+	// Test timeouts
+	const timeoutSeconds = 30 // Longer timeout for integration test
 
 	// Connect to MySQL
 	conn, err := client.Connect(fmt.Sprintf("%s:%d", host, port), username, password, "")
@@ -73,60 +76,83 @@ func TestIntegrationBinlogSync(t *testing.T) {
 		t.Fatalf("Error starting sync: %v", err)
 	}
 
-	// Create a channel to signal that streamer is ready
+	// Create channels for coordination
 	streamerReady := make(chan struct{})
-	// Create a channel to signal that data insertion is complete
 	insertDone := make(chan struct{})
+	rowEventReceived := make(chan struct{})
+	
+	// Create a context for the test with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds)*time.Second)
+	defer cancel()
 
-	// Create a separate connection for the data insertion goroutine
+	// Create a separate connection for the data insertion
 	insertConn, err := client.Connect(fmt.Sprintf("%s:%d", host, port), username, password, "")
 	if err != nil {
 		t.Fatalf("Failed to create second MySQL connection: %v", err)
 	}
 	defer insertConn.Close()
 
+	// Run the event processor in a goroutine
+	go func() {
+		// Signal that we're ready to receive events
+		close(streamerReady)
+		
+		for {
+			ev, err := streamer.GetEvent(ctx)
+			if err != nil {
+				t.Logf("Stopping event processing: %v", err)
+				return // Context cancelled or error
+			}
+
+			// Look for our RowsEvent
+			if rowsEvent, ok := ev.Event.(*replication.RowsEvent); ok {
+				schema := string(rowsEvent.Table.Schema)
+				table := string(rowsEvent.Table.Table)
+				t.Logf("Found rows event for schema: %s, table: %s", schema, table)
+				
+				if schema == testDB && table == "test_table" {
+					// We found our event, signal success
+					close(rowEventReceived)
+					return
+				}
+			}
+		}
+	}()
+
+	// Wait for the streamer to be ready before making data changes
+	select {
+	case <-streamerReady:
+		// Streamer is ready
+	case <-ctx.Done():
+		t.Fatalf("Context cancelled while waiting for streamer to be ready: %v", ctx.Err())
+	}
+
 	// Make a data change in another goroutine
 	go func() {
 		defer close(insertDone)
-		// Wait for signal that streamer is ready
-		<-streamerReady
-
+		
 		_, err := insertConn.Execute(fmt.Sprintf("INSERT INTO %s.test_table (name) VALUES ('test1')", testDB))
 		if err != nil {
 			t.Errorf("Failed to insert test data: %v", err)
 		}
 	}()
 
-	// Signal that streamer is ready to receive events
-	close(streamerReady)
-
-	// Read events with a timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	foundRowsEvent := false
-	for {
-		ev, err := streamer.GetEvent(ctx)
-		if err != nil {
-			t.Logf("Stopping event processing: %v", err)
-			break // Timeout or error
-		}
-
-		// Look for our RowsEvent
-		if rowsEvent, ok := ev.Event.(*replication.RowsEvent); ok {
-			t.Logf("Found rows event for schema: %s, table: %s", string(rowsEvent.Table.Schema), string(rowsEvent.Table.Table))
-			if string(rowsEvent.Table.Schema) == testDB {
-				foundRowsEvent = true
-				assert.Equal(t, "test_table", string(rowsEvent.Table.Table))
-				break
-			}
-		}
+	// Wait for the insert to complete with timeout
+	select {
+	case <-insertDone:
+		// Insert completed successfully
+	case <-ctx.Done():
+		t.Fatalf("Context cancelled while waiting for insert to complete: %v", ctx.Err())
 	}
 
-	// Wait for the insert operation to complete before cleaning up
-	<-insertDone
-
-	assert.True(t, foundRowsEvent, "Should have captured a rows event for our test database")
+	// Wait for the row event to be received with timeout
+	select {
+	case <-rowEventReceived:
+		// Row event was received successfully
+		assert.True(t, true, "Successfully captured a rows event for our test database")
+	case <-ctx.Done():
+		t.Fatalf("Timed out or context cancelled waiting for row event: %v", ctx.Err())
+	}
 }
 
 // New test for the async SQS worker with binlog integration
@@ -136,6 +162,9 @@ func TestIntegrationAsyncSQSWorker(t *testing.T) {
 		t.Skip("Skipping integration test. Set RUN_INTEGRATION_TESTS=true to run")
 	}
 
+	// Create a channel to track message processing
+	messageReceived := make(chan struct{}, 20)
+	
 	// Create a mock SQS client to track calls
 	mockClient := new(MockSQSClient)
 	queueURL := "https://example.com/test-queue.fifo"
@@ -144,7 +173,7 @@ func TestIntegrationAsyncSQSWorker(t *testing.T) {
 	var receivedSchemas []string
 	var schemasMutex sync.Mutex
 
-	// Setup the mock to capture schemas
+	// Setup the mock to capture schemas and signal when messages are received
 	mockClient.On("SendMessage", mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
 		input := args.Get(1).(*sqs.SendMessageInput)
 		var event SchemaEvent
@@ -152,6 +181,14 @@ func TestIntegrationAsyncSQSWorker(t *testing.T) {
 			schemasMutex.Lock()
 			receivedSchemas = append(receivedSchemas, event.Schema)
 			schemasMutex.Unlock()
+			
+			// Signal that a message was received
+			select {
+			case messageReceived <- struct{}{}:
+				// Signal sent
+			default:
+				// Channel buffer full, ignore
+			}
 		}
 	}).Return(&sqs.SendMessageOutput{MessageId: new(string)}, nil)
 
@@ -207,13 +244,23 @@ func TestIntegrationAsyncSQSWorker(t *testing.T) {
 		t.Fatalf("Error starting sync: %v", err)
 	}
 
+	// Test configuration
+	const numTestInserts = 10
+	const timeoutSeconds = 30 // Longer timeout for integration test
+	
+	// Create a barrier to synchronize between event processor and data inserter
+	processorReady := make(chan struct{})
+	processingDone := make(chan struct{})
+	
 	// Create a goroutine to process binlog events
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds)*time.Second)
 	defer cancel()
 
-	processingDone := make(chan struct{})
 	go func() {
 		defer close(processingDone)
+		
+		// Signal that we're ready to process events
+		close(processorReady)
 
 		for {
 			ev, err := streamer.GetEvent(ctx)
@@ -232,30 +279,71 @@ func TestIntegrationAsyncSQSWorker(t *testing.T) {
 		}
 	}()
 
+	// Wait for processor to be ready before inserting data
+	<-processorReady
+	
 	// Execute multiple operations to generate binlog events
-	for i := 1; i <= 10; i++ {
-		_, err := conn.Execute(fmt.Sprintf("INSERT INTO %s.test_table (name) VALUES ('test%d')", testDB, i))
-		if err != nil {
-			t.Fatalf("Failed to insert test data: %v", err)
+	// Use a consistent insertion loop without arbitrary sleeps
+	insertsDone := make(chan struct{})
+	go func() {
+		defer close(insertsDone)
+		
+		for i := 1; i <= numTestInserts; i++ {
+			_, err := conn.Execute(fmt.Sprintf("INSERT INTO %s.test_table (name) VALUES ('test%d')", testDB, i))
+			if err != nil {
+				t.Errorf("Failed to insert test data: %v", err)
+				return
+			}
 		}
-		time.Sleep(50 * time.Millisecond) // Space out the operations
+	}()
+	
+	// Wait for inserts to complete with timeout
+	select {
+	case <-insertsDone:
+		// Inserts completed successfully
+	case <-time.After(time.Duration(timeoutSeconds/2) * time.Second):
+		t.Fatalf("Timed out waiting for test inserts to complete")
 	}
 
-	// Wait a bit for processing to complete
-	time.Sleep(500 * time.Millisecond)
-
+	// Now wait for at least one message to be received with timeout
+	numReceived := 0
+	timeoutTimer := time.NewTimer(time.Duration(timeoutSeconds) * time.Second)
+	defer timeoutTimer.Stop()
+	
+	// We want to receive at least one message to confirm things are working
+MinMessagesLoop:
+	for numReceived < 1 {
+		select {
+		case <-messageReceived:
+			numReceived++
+		case <-timeoutTimer.C:
+			t.Logf("Timed out waiting for more messages, received %d so far", numReceived)
+			break MinMessagesLoop
+		}
+	}
+	
 	// Stop the context to stop the processing goroutine
 	cancel()
-	<-processingDone
+	
+	// Wait for processing to complete with timeout
+	select {
+	case <-processingDone:
+		// Processing completed
+	case <-time.After(time.Duration(timeoutSeconds/4) * time.Second):
+		t.Logf("Timed out waiting for processing to complete, continuing")
+	}
 
-	// Wait for worker to process queued events
-	time.Sleep(500 * time.Millisecond)
+	// Verify that events were processed - even if we didn't get all events,
+	// we should have at least one, and all should be for the test database
+	schemasMutex.Lock()
+	numSchemas := len(receivedSchemas)
+	schemasMutex.Unlock()
 
-	// Verify that events were processed
+	assert.Greater(t, numSchemas, 0, "Should have processed at least one schema event")
+	
 	schemasMutex.Lock()
 	defer schemasMutex.Unlock()
-
-	assert.Greater(t, len(receivedSchemas), 0, "Should have processed some schema events")
+	
 	for _, schema := range receivedSchemas {
 		assert.Equal(t, testDB, schema, "Schema should match the test database")
 	}

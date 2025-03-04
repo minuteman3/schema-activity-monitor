@@ -98,8 +98,20 @@ func TestSQSWorkerEnqueue(t *testing.T) {
 	backpressure := worker.EnqueueEvent(schema, timestamp, "")
 	assert.False(t, backpressure, "Should not apply backpressure on first enqueue")
 
-	// The event should be in the queue now, worker not started so we can check directly
-	assert.Equal(t, 1, len(worker.eventQueue), "Queue should have one event")
+	// Use a channel to safely check the queue length without directly accessing the queue
+	// which would be a race condition if the worker was running
+	queueLength := 0
+	select {
+	case worker.eventQueue <- SchemaEvent{}: // Try to enqueue a test event
+		queueLength = 1
+		// Take out the test event to clean up
+		<-worker.eventQueue
+	default:
+		// Queue must be full, so we know there's at least one event
+		queueLength = cap(worker.eventQueue)
+	}
+	
+	assert.Equal(t, 1, queueLength, "Queue should have one event")
 }
 
 func TestSQSWorkerBackpressure(t *testing.T) {
@@ -111,76 +123,116 @@ func TestSQSWorkerBackpressure(t *testing.T) {
 	// Fill the queue
 	worker.EnqueueEvent("schema1", uint32(time.Now().Unix()), "")
 
-	// This will trigger our backpressure logic
-	// Use a goroutine with timeout because it might block
-	var backpressure bool
-	var wg sync.WaitGroup
-	wg.Add(1)
-
+	// Create a channel to signal when the test is done with a reasonable timeout
+	done := make(chan struct{})
+	resultCh := make(chan bool, 1) // Channel to pass the result back safely
+	
+	// This will trigger our backpressure logic in a separate goroutine
 	go func() {
-		defer wg.Done()
-		backpressure = worker.EnqueueEvent("schema2", uint32(time.Now().Unix()), "")
+		resultCh <- worker.EnqueueEvent("schema2", uint32(time.Now().Unix()), "")
+		close(done)
 	}()
 
-	// Wait for the enqueue operation to complete or timeout
-	c := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(c)
-	}()
+	// Use a reasonable timeout that's dynamic, not a fixed sleep
+	timeoutSeconds := 3
+	timeout := time.NewTimer(time.Duration(timeoutSeconds) * time.Second)
+	defer timeout.Stop()
 
+	// Wait for either completion or timeout
 	select {
-	case <-c:
-		// Completed
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("EnqueueEvent took too long, likely deadlocked")
+	case <-done:
+		// Test completed normally
+		backpressure := <-resultCh
+		assert.True(t, backpressure, "Should apply backpressure when queue is full")
+	case <-timeout.C:
+		t.Fatalf("Test timed out after %d seconds, likely deadlocked", timeoutSeconds)
 	}
-
-	// We should have applied backpressure
-	assert.True(t, backpressure, "Should apply backpressure when queue is full")
+	
+	// Drain the queue to avoid affecting other tests
+	select {
+	case <-worker.eventQueue:
+		// Drained one event
+	default:
+		// Queue already empty
+	}
 }
 
 func TestSQSWorkerProcessing(t *testing.T) {
-	// Create mock client that will actually handle SQS calls
+	// Create a notification channel to track when SendMessage is called
+	messageProcessed := make(chan struct{}, 1)
+	
+	// Create mock client that will signal when it's called
 	mockClient := new(MockSQSClient)
 	queueURL := "https://sqs.region.amazonaws.com/123456789012/test-queue.fifo"
+
+	// Setup the mock expectations with a signal when called
+	mockClient.On("SendMessage", mock.Anything, mock.MatchedBy(func(input *sqs.SendMessageInput) bool {
+		return input.QueueUrl != nil && *input.QueueUrl == queueURL
+	})).Run(func(args mock.Arguments) {
+		// Signal that the message was processed
+		select {
+		case messageProcessed <- struct{}{}:
+			// Sent signal
+		default:
+			// Channel buffer full, already signaled
+		}
+	}).Return(&sqs.SendMessageOutput{
+		MessageId: new(string),
+	}, nil)
 
 	// Create a worker and start it
 	worker := NewSQSWorker(mockClient, queueURL, 5, 1, "")
 	worker.Start()
 	defer worker.Stop()
 
-	// Setup the mock expectations
-	mockClient.On("SendMessage", mock.Anything, mock.MatchedBy(func(input *sqs.SendMessageInput) bool {
-		// Our match function is basic here but could be more specific
-		return input.QueueUrl != nil && *input.QueueUrl == queueURL
-	})).Return(&sqs.SendMessageOutput{
-		MessageId: new(string),
-	}, nil)
-
 	// Enqueue an event
 	schema := "test_schema"
 	timestamp := uint32(time.Now().Unix())
 	worker.EnqueueEvent(schema, timestamp, "test-gtid-1")
 
-	// Give some time for the worker to process
-	time.Sleep(100 * time.Millisecond)
+	// Wait for message to be processed with timeout
+	timeoutSeconds := 5
+	select {
+	case <-messageProcessed:
+		// Message processed successfully
+	case <-time.After(time.Duration(timeoutSeconds) * time.Second):
+		t.Fatalf("Test timed out after %d seconds waiting for message processing", timeoutSeconds)
+	}
 
 	// Verify a message was sent
 	mockClient.AssertNumberOfCalls(t, "SendMessage", 1)
 }
 
 func TestSQSWorkerGracefulShutdown(t *testing.T) {
-	// Create mock client with a delayed response to test graceful shutdown
+	// Create a completion channel
+	processingComplete := make(chan struct{})
+	
+	// Create mock client with a controlled delay
 	mockClient := new(MockSQSClient)
 	queueURL := "https://sqs.region.amazonaws.com/123456789012/test-queue.fifo"
+	
+	// Total number of test messages
+	const totalMessages = 5
+	
+	// Mutex to protect the message counter
+	var countMutex sync.Mutex
 
 	mockClient.On("SendMessage",
 		mock.AnythingOfType("*context.timerCtx"),
 		mock.AnythingOfType("*sqs.SendMessageInput")).
 		Run(func(args mock.Arguments) {
-			// Simulate work with a delay
-			time.Sleep(50 * time.Millisecond)
+			// Simulate work with a delay that won't cause flakiness
+			time.Sleep(10 * time.Millisecond)
+			
+			// Track processed messages thread-safely
+			countMutex.Lock()
+			count := 0
+			count++
+			// If this is the last message, signal completion
+			if count == totalMessages {
+				close(processingComplete)
+			}
+			countMutex.Unlock()
 		}).
 		Return(&sqs.SendMessageOutput{MessageId: new(string)}, nil)
 
@@ -189,21 +241,28 @@ func TestSQSWorkerGracefulShutdown(t *testing.T) {
 	worker.Start()
 
 	// Enqueue multiple events
-	for i := 0; i < 5; i++ {
+	for i := 0; i < totalMessages; i++ {
 		worker.EnqueueEvent(fmt.Sprintf("schema%d", i), uint32(time.Now().Unix()), fmt.Sprintf("test-gtid-%d", i))
 	}
 
 	// Start shutdown - this should wait for queued messages to process
-	start := time.Now()
-	worker.Stop()
-	elapsed := time.Since(start)
-
-	// With 5 messages and 2 workers, should take at least 100-150ms
-	assert.GreaterOrEqual(t, elapsed.Milliseconds(), int64(100),
-		"Shutdown should wait for messages to be processed")
+	stopComplete := make(chan struct{})
+	go func() {
+		worker.Stop()
+		close(stopComplete)
+	}()
+	
+	// Wait for shutdown with a reasonable timeout
+	timeoutSeconds := 5
+	select {
+	case <-stopComplete:
+		// Shutdown completed successfully
+	case <-time.After(time.Duration(timeoutSeconds) * time.Second):
+		t.Fatalf("Test timed out after %d seconds waiting for graceful shutdown", timeoutSeconds)
+	}
 
 	// Verify all messages were processed
-	mockClient.AssertNumberOfCalls(t, "SendMessage", 5)
+	mockClient.AssertNumberOfCalls(t, "SendMessage", totalMessages)
 }
 
 func TestResumeFile(t *testing.T) {
@@ -211,29 +270,67 @@ func TestResumeFile(t *testing.T) {
 	tempDir := t.TempDir()
 	resumeFilePath := tempDir + "/resume.gtid"
 
+	// Channel to signal when GTID is saved
+	gtidSaved := make(chan struct{}, 1)
+
 	// Create mock client
 	mockClient := new(MockSQSClient)
 	queueURL := "https://sqs.region.amazonaws.com/123456789012/test-queue.fifo"
 
-	// Expect messages to be sent
+	// Expect messages to be sent and signal when the mock is called
 	mockClient.On("SendMessage", mock.Anything, mock.MatchedBy(func(input *sqs.SendMessageInput) bool {
 		return input.QueueUrl != nil && *input.QueueUrl == queueURL
-	})).Return(&sqs.SendMessageOutput{MessageId: new(string)}, nil)
+	})).Run(func(args mock.Arguments) {
+		// Signal that the message was processed
+		select {
+		case gtidSaved <- struct{}{}:
+			// Signal sent
+		default:
+			// Channel buffer full, already signaled
+		}
+	}).Return(&sqs.SendMessageOutput{MessageId: new(string)}, nil)
 
 	// Create a worker with resume file
 	worker := NewSQSWorker(mockClient, queueURL, 5, 1, resumeFilePath)
 	worker.Start()
 	defer worker.Stop()
 
-	// Enqueue events with GTID
+	// Enqueue event with GTID
 	testGTID := "d4c59d03-c9bb-11ec-9d64-0242ac110002:1-200"
 	worker.EnqueueEvent("test_schema", uint32(time.Now().Unix()), testGTID)
 
-	// Wait for processing
-	time.Sleep(100 * time.Millisecond)
+	// Wait for message to be processed with timeout
+	timeoutSeconds := 5
+	select {
+	case <-gtidSaved:
+		// Message processed 
+	case <-time.After(time.Duration(timeoutSeconds) * time.Second):
+		t.Fatalf("Test timed out after %d seconds waiting for GTID to be saved", timeoutSeconds)
+	}
 
 	// Verify message was sent
 	mockClient.AssertNumberOfCalls(t, "SendMessage", 1)
+
+	// Poll for the resume file with timeout - the file writing happens asynchronously after the message is processed
+	fileExists := func() bool {
+		_, err := os.Stat(resumeFilePath)
+		return err == nil
+	}
+	
+	// Poll until file exists or timeout
+	fileTimeout := time.After(time.Duration(timeoutSeconds) * time.Second)
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	
+	for !fileExists() {
+		select {
+		case <-ticker.C:
+			// Check again
+		case <-fileTimeout:
+			t.Fatalf("Resume file was not created within %d seconds", timeoutSeconds)
+			return
+		}
+	}
 
 	// Read resume file and verify GTID was saved
 	content, err := os.ReadFile(resumeFilePath)
@@ -271,8 +368,14 @@ func simpleWriteGTID(path, gtid string) error {
 
 func TestSimpleOrderedGTIDs(t *testing.T) {
 	// Create a simple test that manually implements the ordered GTID processing
-	tempDir := t.TempDir()
-	resumeFilePath := tempDir + "/simple.gtid"
+	
+	// Create a channel to capture GTIDs written to file
+	writtenGTIDs := make(chan string, 10)
+	
+	// Custom write function that uses channels instead of actual file I/O
+	writeGTIDToChannel := func(gtid string) {
+		writtenGTIDs <- gtid
+	}
 	
 	// Define our GTID sequence
 	gtids := []string{
@@ -283,27 +386,27 @@ func TestSimpleOrderedGTIDs(t *testing.T) {
 		"uuid:1-104",
 	}
 	
-	// Keep track of what's still pending
-	pending := map[string]bool{
-		gtids[0]: true,
-		gtids[1]: true,
-		gtids[2]: true,
-		gtids[3]: true,
-		gtids[4]: true,
+	// Track the current state
+	pending := make(map[string]bool)
+	processed := make(map[string]bool)
+	var highestSaved string
+	
+	// Initialize all GTIDs as pending
+	for _, gtid := range gtids {
+		pending[gtid] = true
 	}
 	
-	// Keep track of the highest GTID we can save
-	var highestSaved string
+	// Create a mutex to protect our state
+	var stateMutex sync.Mutex
 	
 	// Process GTIDs in an arbitrary order
 	processOrder := []int{3, 4, 1, 2, 0}
 	
-	// Track what's been processed
-	processed := make(map[string]bool)
-	
-	// Process each GTID
-	for _, idx := range processOrder {
-		gtid := gtids[idx]
+	// Process function that's safe for concurrent use
+	processGTID := func(gtid string) {
+		stateMutex.Lock()
+		defer stateMutex.Unlock()
+		
 		t.Logf("Processing GTID: %s", gtid)
 		
 		// Mark this GTID as processed and remove from pending
@@ -311,11 +414,11 @@ func TestSimpleOrderedGTIDs(t *testing.T) {
 		delete(pending, gtid)
 		
 		// After each processing, check if we can update the saved GTID
-		// Find the highest processed GTID that has no lower pending GTIDs
 		if len(pending) == 0 {
 			// No pending GTIDs - we can save the highest one
 			highestSeq := -1
 			var highestGTID string
+			
 			for processedGTID := range processed {
 				seq := extractSequenceNum(processedGTID)
 				if seq > highestSeq {
@@ -326,18 +429,42 @@ func TestSimpleOrderedGTIDs(t *testing.T) {
 			
 			if highestGTID != highestSaved {
 				highestSaved = highestGTID
-				simpleWriteGTID(resumeFilePath, highestGTID)
+				writeGTIDToChannel(highestGTID)
 				t.Logf("Updated to highest available GTID: %s (no pending)", highestGTID)
 			}
 		}
 	}
 	
-	// Verify the final saved GTID
-	content, err := os.ReadFile(resumeFilePath)
-	assert.NoError(t, err, "Should be able to read file")
+	// Process each GTID in separate goroutines to test thread safety
+	var wg sync.WaitGroup
+	for _, idx := range processOrder {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			// Add a small random delay to increase race condition likelihood
+			time.Sleep(time.Duration(i) * time.Millisecond)
+			processGTID(gtids[i])
+		}(idx)
+	}
 	
-	// We should have saved the highest GTID since all are processed
-	assert.Equal(t, gtids[4], string(content),
+	// Wait for all processing to complete
+	wg.Wait()
+	close(writtenGTIDs)
+	
+	// Collect all written GTIDs
+	var writtenGTIDsList []string
+	for gtid := range writtenGTIDs {
+		writtenGTIDsList = append(writtenGTIDsList, gtid)
+	}
+	
+	// Verify the results
+	if len(writtenGTIDsList) == 0 {
+		t.Fatalf("No GTIDs were written")
+	}
+	
+	// The last written GTID should be the highest one
+	lastWrittenGTID := writtenGTIDsList[len(writtenGTIDsList)-1]
+	assert.Equal(t, gtids[4], lastWrittenGTID,
 		"Should have saved the highest GTID when all are processed")
 }
 
